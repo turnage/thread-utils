@@ -6,7 +6,6 @@ module Control.Concurrent.Thread.Finalizers
   , finalizeThread
   ) where
 import Control.Concurrent
-import Control.Exception
 import Control.Monad ( void )
 import GHC.IO (IO(..))
 import GHC.Prim ( mkWeak# )

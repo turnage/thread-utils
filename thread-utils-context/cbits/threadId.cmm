@@ -1,0 +1,127 @@
+#include "Cmm.h"
+
+// Memory ordering notes (cross-GHC-version):
+//
+//   GHC 9.4–9.8: prim %read_barrier(), prim %write_barrier()
+//                 (via prim_read_barrier / prim_write_barrier macros)
+//   GHC 9.10+:   prim %fence_acquire(), prim %fence_release(),
+//                 prim %fence_seq_cst()
+//                 (via ACQUIRE_FENCE / RELEASE_FENCE / SEQ_CST_FENCE macros)
+//                 Inline syntax: x = %acquire W_[ptr];
+//
+// These functions don't use barriers because the hot path is always
+// the current thread reading its own entry. Cross-thread reads go
+// through Haskell atomicReadIntArray# which has acquire semantics.
+
+// -----------------------------------------------------------------------
+// stg_getCurrentThreadId
+//
+// Returns the current green thread's ID as an Int#.
+// Reads StgTSO_id(CurrentTSO) directly — no myThreadId# box allocation,
+// no rts_getThreadId FFI call.
+// StgTSO_id is StgWord32; TO_W_ zero-extends to machine word.
+// -----------------------------------------------------------------------
+
+stg_getCurrentThreadId()
+{
+    return (TO_W_(StgTSO_id(CurrentTSO)));
+}
+
+
+// -----------------------------------------------------------------------
+// stg_probeThreadSlot
+//
+// Fused thread ID retrieval + flat-table linear probe.
+// Reads CurrentTSO.id, computes the home slot, then probes the key
+// array until it finds the thread's key, an empty slot (0), or wraps
+// around. Returns (threadId, slotIndex) where slotIndex is -1 if
+// the entry was not found.
+//
+// Arguments:
+//   P_ keys  — MutableByteArray# holding Int-sized keys per slot
+//   W_ mask  — table capacity - 1 (for bitwise AND)
+//
+// Returns: (Int# tid, Int# slot)
+//   slot >= 0  → entry found at that index
+//   slot == -1 → entry not found
+// -----------------------------------------------------------------------
+
+stg_probeThreadSlot(P_ keys, W_ mask)
+{
+    W_ tid, home, slot, key, base;
+
+    tid  = TO_W_(StgTSO_id(CurrentTSO));
+    home = tid & mask;
+    slot = home;
+    base = keys + SIZEOF_StgArrBytes;
+
+  again:
+    key = W_[base + WDS(slot)];
+
+    if (key == tid) {
+        // No barrier needed: the hot path is the current thread reading
+        // its own entry, so all writes are from the same thread.
+        // Cross-thread reads go through the Haskell API which uses
+        // atomicReadIntArray# (has acquire semantics).
+        return (tid, slot);
+    }
+
+    if (key == 0) {
+        // Empty slot — end of probe chain, entry does not exist.
+        return (tid, -1);
+    }
+
+    // Tombstone or different key — continue probing.
+    slot = (slot + 1) & mask;
+    if (slot != home) {
+        goto again;
+    }
+
+    // Wrapped all the way around — table full, entry not found.
+    return (tid, -1);
+}
+
+
+// -----------------------------------------------------------------------
+// stg_probeSlotByKey
+//
+// Linear probe with an explicit key (not CurrentTSO).
+// Used by lookupRaw / updateRaw / adjustOnThread where the caller
+// supplies a pre-computed numeric thread ID.
+//
+// Arguments:
+//   P_ keys  — MutableByteArray# holding Int-sized keys per slot
+//   W_ mask  — table capacity - 1 (for bitwise AND)
+//   W_ tid   — the key to search for
+//
+// Returns: Int# slot
+//   slot >= 0  → entry found at that index
+//   slot == -1 → entry not found
+// -----------------------------------------------------------------------
+
+stg_probeSlotByKey(P_ keys, W_ mask, W_ tid)
+{
+    W_ home, slot, key, base;
+
+    home = tid & mask;
+    slot = home;
+    base = keys + SIZEOF_StgArrBytes;
+
+  again:
+    key = W_[base + WDS(slot)];
+
+    if (key == tid) {
+        return (slot);
+    }
+
+    if (key == 0) {
+        return (-1);
+    }
+
+    slot = (slot + 1) & mask;
+    if (slot != home) {
+        goto again;
+    }
+
+    return (-1);
+}

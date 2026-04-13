@@ -1,224 +1,1090 @@
-{-# LANGUAGE MagicHash #-}
-{-# LANGUAGE UnliftedFFITypes #-}
-{-# LANGUAGE UnboxedTuples #-}
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
--- | A perilous implementation of thread-local storage for Haskell.
--- This module uses a fair amount of GHC internals to enable performing
--- lookups of context for any threads that are alive. Caution should be
--- taken for consumers of this module to not retain ThreadId references
--- indefinitely, as that could delay cleanup of thread-local state.
---
--- Thread-local contexts have the following semantics:
---
--- - A value 'attach'ed to a 'ThreadId' will remain alive at least as long
---   as the 'ThreadId'. 
--- - A value may be detached from a 'ThreadId' via 'detach' by the
---   library consumer without detriment.
--- - No guarantees are made about when a value will be garbage-collected
---   once all references to 'ThreadId' have been dropped. However, this simply
---   means in practice that any unused contexts will cleaned up upon the next
---   garbage collection and may not be actively freed when the program exits.
---
--- Note that this implementation of context sharing is
--- mildly expensive for the garbage collector, hard to reason about without deep
--- knowledge of the code you are instrumenting, and has limited guarantees of behavior 
--- across GHC versions due to internals usage.
-module Control.Concurrent.Thread.Storage 
-  ( 
-    -- * Create a 'ThreadStorageMap'
-    ThreadStorageMap
-  , newThreadStorageMap
-    -- * Retrieve values from a 'ThreadStorageMap'
-  , lookup
-  , lookupOnThread
-    -- * Update values in a 'ThreadStorageMap'
-  , update
-  , updateOnThread
-    -- * Associate values with a thread in a 'ThreadStorageMap'
-  , attach
-  , attachOnThread
-    -- * Remove values from a thread in a 'ThreadStorageMap'
-  , detach
-  , detachFromThread
-    -- * Update values for a thread in a 'ThreadStorageMap'
-  , adjust
-  , adjustOnThread
-    -- * Monitoring utilities
-  , storedItems
-    -- * Thread ID manipulation
-  , getThreadId
-#if MIN_VERSION_base(4,18,0)
-  , purgeDeadThreads
-#endif
-  ) where
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE GHCForeignImportPrim #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE UnliftedFFITypes #-}
 
-import Control.Concurrent
-import Control.Concurrent.Thread.Finalizers
-import Control.Monad ( when, void, forM_ )
-import Control.Monad.IO.Class
-import Data.Maybe (isNothing, isJust)
-import Data.Word (Word64)
+-- |
+-- Thread-local storage for Haskell green threads.
+--
+-- Associates at most one value of type @a@ with each green thread in a
+-- 'ThreadStorageMap'. Values are automatically cleaned up by a GC finalizer
+-- when the owning thread dies.
+--
+-- == Implementation
+--
+-- Internally, a 'ThreadStorageMap' is a flat open-addressed hash table that
+-- resizes automatically when full. Keys (thread IDs) live in a
+-- 'MutableByteArray#' with per-slot atomic CAS; values live in a GC-traced
+-- 'MutableArray#' of 'IORef's. On resize, a new table is allocated at
+-- double the capacity, live entries are copied (cleaning tombstones), and
+-- the reference is swapped under an 'MVar' lock that serializes resize
+-- operations — at most one thread performs the expensive copy-and-swap at a
+-- time while other inserters wait. In-flight readers on the old table are
+-- safe because the old arrays remain valid GC objects and the per-thread
+-- 'IORef's are shared between old and new tables.
+--
+-- Reads and writes on the hot path go directly to the per-thread 'IORef' —
+-- zero CAS, zero contention. CAS is only used during thread /registration/
+-- (once per thread lifetime) and during finalizer-driven cleanup.
+--
+-- Two CMM primops avoid allocation and FFI overhead on the hot path:
+--
+--   * @stg_getCurrentThreadId@ — reads @StgTSO_id(CurrentTSO)@ directly.
+--   * @stg_probeThreadSlot@ — fuses thread-ID retrieval with a linear probe
+--     of the key array.
+--
+-- == Choosing an API tier
+--
+-- This module exposes three tiers of API, from simplest to fastest:
+--
+-- [High-level] 'attach', 'detach', 'lookup', 'update', 'adjust' and their
+-- @…OnThread@ variants. Each call resolves the thread ID internally. Fine
+-- when you make only one or two calls per operation.
+--
+-- [Raw] 'getThreadId' \/ 'lookupRaw' \/ 'updateRaw'. Pre-compute the
+-- thread-ID word once, then pass it to several operations on the same
+-- thread without repeated FFI calls.
+--
+-- [Ref-based] 'ensureRefFast' \/ 'lookupRefFast' \/ 'readRef' \/ 'writeRef'
+-- \/ 'modifyRef'. On the fast path (thread already registered), the entire
+-- lookup is a single CMM call plus an 'IORef' dereference. Subsequent reads
+-- and writes are plain 'IORef' operations — no hash-table probe at all.
+-- Use this tier in instrumentation hot loops (e.g. tracing spans).
+--
+-- == Lifecycle
+--
+-- * A value 'attach'ed to a thread remains reachable at least as long as the
+--   thread is alive.
+-- * A value may be explicitly removed via 'detach' at any time.
+-- * After a thread dies, its finalizer tombstones the slot. The 'IORef' (and
+--   the value it holds) become eligible for GC once no other references
+--   remain.
+-- * 'purgeDeadThreads' can be used to eagerly reclaim slots for threads that
+--   have exited but whose finalizers have not yet run. (GHC >= 9.6 only.)
+module Control.Concurrent.Thread.Storage (
+  -- * The map type
+  ThreadStorageMap,
+
+  -- * Construction
+  newThreadStorageMap,
+  newThreadStorageMapWith,
+
+  -- * High-level API
+  -- $high-level
+
+  -- ** Lookup
+  lookup,
+  lookupOnThread,
+
+  -- ** Insert \/ replace
+  attach,
+  attachOnThread,
+
+  -- ** Remove
+  detach,
+  detachFromThread,
+
+  -- ** General update
+  update,
+  updateOnThread,
+
+  -- ** In-place modification
+  adjust,
+  adjustOnThread,
+
+  -- * Raw API
+  -- $raw
+  getThreadId,
+  getCurrentThreadId,
+  lookupRaw,
+  updateRaw,
+
+  -- * Ref-based API
+  -- $ref-based
+  ensureRef,
+  ensureRefFast,
+  lookupRef,
+  lookupRefFast,
+  readRef,
+  writeRef,
+  modifyRef,
+
+  -- * Monitoring
+  storedItems,
+#if MIN_VERSION_base(4,18,0)
+  purgeDeadThreads,
+#endif
+) where
+
+import Control.Concurrent (MVar, ThreadId, myThreadId, newMVar, withMVar)
+import Control.Concurrent.Thread.Finalizers (addThreadFinalizer)
+import Control.Monad (when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.Bits (countLeadingZeros, finiteBitSize, unsafeShiftL, (.&.))
+import Data.IORef
+import Foreign.C.Types (CULLong (..))
+import Foreign.Storable (sizeOf)
 import GHC.Base (Addr#)
-import GHC.IO (IO(..), mask_)
-import GHC.Int
+import GHC.Conc (getNumCapabilities, yield)
+import GHC.Conc.Sync (ThreadId (..))
+import GHC.Exts (Int (..), Int#, isTrue#, unsafeCoerce#, (==#), (>=#))
+import qualified GHC.Exts as Exts
+import GHC.IO (IO (..))
+import System.IO.Unsafe (unsafePerformIO)
 #if MIN_VERSION_base(4,18,0)
 import GHC.Conc (listThreads)
 #endif
-import GHC.Conc.Sync ( ThreadId(..) )
-import GHC.Prim
-import qualified Data.IntMap.Strict as I
-import qualified Data.IntSet as IS
-import Foreign.C.Types
 import Prelude hiding (lookup)
-import GHC.Exts (unsafeCoerce#)
+
+
+---------------------------------------------------------------------------
+-- CMM primops
+---------------------------------------------------------------------------
+
+foreign import prim "stg_getCurrentThreadId"
+  stg_getCurrentThreadId# :: Exts.State# Exts.RealWorld -> (# Exts.State# Exts.RealWorld, Int# #)
+
+
+foreign import prim "stg_probeThreadSlot"
+  stg_probeThreadSlot#
+    :: Exts.MutableByteArray# Exts.RealWorld
+    -> Int#
+    -> Exts.State# Exts.RealWorld
+    -> (# Exts.State# Exts.RealWorld, Int#, Int# #)
+
+
+foreign import prim "stg_probeSlotByKey"
+  stg_probeSlotByKey#
+    :: Exts.MutableByteArray# Exts.RealWorld
+    -> Int#
+    -> Int#
+    -> Exts.State# Exts.RealWorld
+    -> (# Exts.State# Exts.RealWorld, Int# #)
+
+
+---------------------------------------------------------------------------
+-- Thread ID extraction
+---------------------------------------------------------------------------
+
+-- | Read the current green thread's numeric ID directly from @CurrentTSO@.
+--
+-- This is implemented as a CMM primop — no 'ThreadId' box is allocated and
+-- no FFI call is made. Prefer this over @'getThreadId' =<< 'myThreadId'@
+-- whenever you do not need the 'ThreadId' value itself.
+getCurrentThreadId :: IO Int
+getCurrentThreadId = IO $ \s ->
+  case stg_getCurrentThreadId# s of
+    (# s', tid# #) -> (# s', I# tid# #)
+{-# INLINE getCurrentThreadId #-}
+
 
 foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: Addr# -> CULLong
 
-numStripes :: Word
-numStripes = 32
 
+-- | Extract the numeric thread ID from an existing 'ThreadId'.
+--
+-- This makes a cheap FFI call to @rts_getThreadId@. When you already hold a
+-- 'ThreadId' and need its numeric form for 'lookupRaw' or 'updateRaw', use
+-- this. Otherwise prefer 'getCurrentThreadId'.
 getThreadId :: ThreadId -> Word
 getThreadId (ThreadId tid#) = fromIntegral (c_getThreadId (unsafeCoerce# tid#))
+{-# INLINE getThreadId #-}
 
-stripeHash :: Word -> Int
-stripeHash = fromIntegral . (`mod` numStripes)
 
-readStripe :: ThreadStorageMap a -> ThreadId -> IO (I.IntMap a)
-readStripe (ThreadStorageMap arr#) t = IO $ \s -> readArray# arr# tid# s
-  where
-    (I# tid#) = stripeHash $ getThreadId t
+getThreadIdInt :: ThreadId -> Int
+getThreadIdInt (ThreadId tid#) = fromIntegral (c_getThreadId (unsafeCoerce# tid#))
+{-# INLINE getThreadIdInt #-}
 
-atomicModifyStripe :: ThreadStorageMap a -> Word -> (I.IntMap a -> (I.IntMap a, b)) -> IO b
-atomicModifyStripe (ThreadStorageMap arr#) tid f = IO $ \s -> go s
-  where
-    (I# stripe#) = fromIntegral $ stripeHash tid
-    go s = case readArray# arr# stripe# s of
-      (# s1, intMap #) ->
-        let (updatedIntMap, result) = f intMap 
-        in case casArray# arr# stripe# intMap updatedIntMap s1 of
-             (# s2, outcome, old #) -> case outcome of
-               0# -> (# s2, result #)
-               1# -> go s2
-               _ -> error "Got impossible result in atomicModifyStripe"
-          
--- | A storage mechanism for values of a type. This structure retains items
--- on per-(green)thread basis, which can be useful in rare cases.
-data ThreadStorageMap a = ThreadStorageMap 
-  (MutableArray# RealWorld (I.IntMap a))
 
--- | Create a new thread storage map. The map is striped by thread
--- into 32 sections in order to reduce contention.
-newThreadStorageMap 
-  :: MonadIO m => m (ThreadStorageMap a)
-newThreadStorageMap = liftIO $ IO $ \s -> case newArray# numStripes# mempty s of
-  (# s1, ma #) -> (# s1, ThreadStorageMap ma #)
-  where
-    (I# numStripes#) = fromIntegral numStripes
+---------------------------------------------------------------------------
+-- Constants
+---------------------------------------------------------------------------
 
--- | Retrieve a value if it exists for the current thread
-lookup :: MonadIO m => ThreadStorageMap a -> m (Maybe a)
-lookup tsm = liftIO $ do
-  tid <- myThreadId
-  lookupOnThread tsm tid
+-- | GHC allocates TSO IDs starting from 1 (@next_thread_id = 1@ in
+-- @rts\/Threads.c@), so 0 is safe as the empty-slot sentinel. If a
+-- future GHC ever starts IDs from 0, this would silently lose the
+-- main thread's entries on resize (where we skip @emptySlot@ keys).
+emptySlot :: Int
+emptySlot = 0
 
--- | Retrieve a value if it exists for the specified thread
-lookupOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> m (Maybe a)
-lookupOnThread tsm tid = liftIO $ do
-  m <- readStripe tsm tid
-  pure $ I.lookup threadAsInt m
-  where 
-    threadAsInt = fromIntegral $ getThreadId tid
+tombstone :: Int
+tombstone = minBound
 
--- | Associate the provided value with the current thread.
+
+-- | Sentinel for uninitialized value-array slots. A single global CAF so
+-- that 'isSentinel' can detect it via pointer identity.  The value is
+-- never read; only the pointer matters.
+{-# NOINLINE sentinelRef #-}
+sentinelRef :: IORef ()
+sentinelRef = unsafePerformIO (newIORef ())
+
+
+-- | Cast the sentinel to any @IORef a@ for use in value arrays.
+toSentinel :: IORef a
+toSentinel = unsafeCoerce# sentinelRef
+{-# INLINE toSentinel #-}
+
+
+-- | Pointer-identity check against the module-level sentinel.
 --
--- Returns the previous value if it was set.
-attach :: MonadIO m => ThreadStorageMap a -> a -> m (Maybe a)
-attach tsm x = liftIO $ do
-  tid <- myThreadId
-  attachOnThread tsm tid x
+-- 'Exts.reallyUnsafePtrEquality#' may return a false negative on GC
+-- boundaries, but never a false positive. A false negative in 'growTable'
+-- just causes one extra spin iteration, which is harmless.
+isSentinel :: IORef a -> Bool
+isSentinel ref = isTrue# (Exts.reallyUnsafePtrEquality# (unsafeCoerce# ref :: IORef ()) sentinelRef)
+{-# INLINE isSentinel #-}
 
--- | Associate the provided value with the specified thread. This replaces
--- any values already associated with the 'ThreadId'.
-attachOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> a -> m (Maybe a)
-attachOnThread tsm tid ctxt = 
-  updateOnThread tsm tid (\prev -> (Just ctxt, prev))
 
--- | Disassociate the associated value from the current thread, returning it if it exists.
-detach :: MonadIO m => ThreadStorageMap a -> m (Maybe a)
-detach tsm = liftIO $ do
-  tid <- myThreadId
-  detachFromThread tsm tid
+nextPow2 :: Int -> Int
+nextPow2 n
+  | n <= 1 = 1
+  | otherwise = 1 `unsafeShiftL` (finiteBitSize n - countLeadingZeros (n - 1))
+{-# INLINE nextPow2 #-}
 
--- | Disassociate the associated value from the specified thread, returning it if it exists.
-detachFromThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> m (Maybe a)
-detachFromThread tsm tid = liftIO $ do
-  let threadAsInt = getThreadId tid
-  updateOnThread tsm tid (\prev -> (Nothing, prev))
 
--- | The most general function in this library. Update a 'ThreadStorageMap' on a given thread,
--- with the ability to add or remove values and return some sort of result.
-updateOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> (Maybe a -> (Maybe a, b)) -> m b
-updateOnThread tsm tid f = liftIO $ mask_ $ do
-  -- ^ We mask here in order to ensure that the finalizer will always be created
-  (isNewThreadEntry, result) <- atomicModifyStripe tsm threadAsWord $ \m -> 
-    let (resultWithNewThreadDetection, m') = 
-          I.alterF 
-            (\x -> case f x of
-              (!x', !y) -> ((isNothing x && isJust x', y), x')
-            ) 
-            (fromIntegral threadAsWord)
-            m
-     in (m', resultWithNewThreadDetection)
-  when isNewThreadEntry $ do
-    addThreadFinalizer tid $ cleanUp tsm threadAsWord
-  pure result
-  where 
-    threadAsWord = getThreadId tid
+---------------------------------------------------------------------------
+-- Data types
+---------------------------------------------------------------------------
 
-update :: MonadIO m => ThreadStorageMap a -> (Maybe a -> (Maybe a, b)) -> m b
-update tsm f = liftIO $ do
-  tid <- myThreadId
-  updateOnThread tsm tid f
+-- | The raw hash table arrays. Swapped atomically on resize.
+data Table a = Table
+  {-# UNPACK #-} !Int -- capacity (power of 2)
+  (Exts.MutableByteArray# Exts.RealWorld) -- keys: Int per slot
+  (Exts.MutableArray# Exts.RealWorld (IORef a)) -- values: GC-traced
 
--- | Update the associated value for the current thread if it is attached.
-adjust :: MonadIO m => ThreadStorageMap a -> (a -> a) -> m ()
-adjust tsm f = liftIO $ do
-  tid <- myThreadId
-  adjustOnThread tsm tid f
 
--- | Update the associated value for the specified thread if it is attached.
-adjustOnThread :: MonadIO m => ThreadStorageMap a -> ThreadId -> (a -> a) -> m ()
-adjustOnThread tsm tid f = liftIO $ do
-  atomicModifyStripe tsm threadAsWord $ \m -> (I.adjust f (fromIntegral threadAsWord) m, ())
-  where 
-    threadAsWord = getThreadId tid 
+-- | A concurrent map from green-thread IDs to values of type @a@.
+--
+-- Each thread may have at most one associated value. The table starts at
+-- an initial capacity (see 'newThreadStorageMap', 'newThreadStorageMapWith')
+-- and doubles automatically when full. Resize operations are serialized by
+-- an internal 'MVar' lock so that at most one thread performs the expensive
+-- copy-and-swap at a time; other threads that discover a full table block
+-- on the lock and retry after the resize completes.
+--
+-- All read paths and ref-based hot-path operations are entirely lock-free.
+-- The 'MVar' is only contended during table growth, which happens
+-- O(log n) times over the life of the map.
+data ThreadStorageMap a = ThreadStorageMap
+  !(IORef (Table a))  -- current table (read-hot, lock-free)
+  !(MVar ())
 
--- Remove this context for thread from the map on finalization
-cleanUp :: ThreadStorageMap a -> Word -> IO ()
-cleanUp tsm tid = do
-  atomicModifyStripe tsm tid $ \m -> 
-    (I.delete (fromIntegral tid) m, ())
 
--- | List thread ids with live entries in the 'ThreadStorageMap'.
--- 
--- This is useful for monitoring purposes to verify that there
--- are no memory leaks retaining threads and thus preventing
--- items from being freed from a 'ThreadStorageMap' 
-storedItems :: ThreadStorageMap a -> IO [(Int, a)]
-storedItems tsm = do
-  stripes <- mapM (stripeByIndex tsm) [0..(fromIntegral numStripes - 1)]
-  pure $ concatMap I.toList stripes
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
+
+slotFor :: Int -> Int -> Int
+slotFor cap tid = tid .&. (cap - 1)
+{-# INLINE slotFor #-}
+
+
+readKey :: Exts.MutableByteArray# Exts.RealWorld -> Int -> IO Int
+readKey keys# (I# i#) = IO $ \s ->
+  case Exts.atomicReadIntArray# keys# i# s of
+    (# s', v# #) -> (# s', I# v# #)
+{-# INLINE readKey #-}
+
+
+writeKey :: Exts.MutableByteArray# Exts.RealWorld -> Int -> Int -> IO ()
+writeKey keys# (I# i#) (I# v#) = IO $ \s ->
+  case Exts.atomicWriteIntArray# keys# i# v# s of
+    s' -> (# s', () #)
+{-# INLINE writeKey #-}
+
+
+casKey :: Exts.MutableByteArray# Exts.RealWorld -> Int -> Int -> Int -> IO Bool
+casKey keys# (I# i#) (I# expected#) (I# new#) = IO $ \s ->
+  case Exts.casIntArray# keys# i# expected# new# s of
+    (# s', old# #) -> (# s', isTrue# (old# ==# expected#) #)
+{-# INLINE casKey #-}
+
+
+readVal :: Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> IO (IORef a)
+readVal vals# (I# i#) = IO $ \s ->
+  Exts.readArray# vals# i# s
+{-# INLINE readVal #-}
+
+
+writeVal :: Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> IORef a -> IO ()
+writeVal vals# (I# i#) ref = IO $ \s ->
+  case Exts.writeArray# vals# i# ref s of
+    s' -> (# s', () #)
+{-# INLINE writeVal #-}
+
+
+probeFind :: Exts.MutableByteArray# Exts.RealWorld -> Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> Int -> Int -> IO (Maybe (Int, IORef a))
+probeFind keys# vals# cap home key = go home 0
   where
-    stripeByIndex :: ThreadStorageMap a -> Int -> IO (I.IntMap a)
-    stripeByIndex (ThreadStorageMap arr#) (I# i#) = IO $ \s -> readArray# arr# i# s
+    !mask = cap - 1
+    go !slot !steps
+      | steps >= cap = pure Nothing
+      | otherwise = do
+          k <- readKey keys# slot
+          if k == key
+            then do
+              ref <- readVal vals# slot
+              pure $! Just (slot, ref)
+            else if k == emptySlot
+              then pure Nothing
+              else go ((slot + 1) .&. mask) (steps + 1)
+{-# INLINE probeFind #-}
+
+
+---------------------------------------------------------------------------
+-- Construction
+---------------------------------------------------------------------------
+
+allocateTable :: Int -> IO (Table a)
+allocateTable requested = IO $ \s0 ->
+  let !cap = nextPow2 (max 16 requested)
+      !(I# cap#) = cap
+      !(I# bytes#) = cap * sizeOf (0 :: Int)
+  in case Exts.newByteArray# bytes# s0 of
+    (# s1, keys# #) ->
+      case Exts.setByteArray# keys# 0# bytes# 0# s1 of
+        s2 -> case Exts.newArray# cap# toSentinel s2 of
+          (# s3, vals# #) ->
+            (# s3, Table cap keys# vals# #)
+
+
+-- | Create a 'ThreadStorageMap' with a default initial capacity derived from
+-- the number of runtime capabilities: @max 128 (capabilities * 32)@, rounded
+-- up to the next power of two.
+--
+-- The table resizes automatically when full, so this is a good default for
+-- most applications.
+newThreadStorageMap :: (MonadIO m) => m (ThreadStorageMap a)
+newThreadStorageMap = liftIO $ do
+  caps <- getNumCapabilities
+  newThreadStorageMapWith (max 128 (caps * 32))
+{-# INLINE newThreadStorageMap #-}
+
+
+-- | Create a 'ThreadStorageMap' with at least the given number of initial
+-- slots.
+--
+-- The actual capacity is rounded up to the next power of two (minimum 16).
+-- The table doubles automatically when it runs out of slots. A load factor
+-- below 0.7 keeps probe chains short; resizing also cleans tombstones.
+newThreadStorageMapWith :: (MonadIO m) => Int -> m (ThreadStorageMap a)
+newThreadStorageMapWith requested = liftIO $ do
+  table <- allocateTable requested
+  ref <- newIORef table
+  lock <- newMVar ()
+  pure (ThreadStorageMap ref lock)
+{-# INLINE newThreadStorageMapWith #-}
+
+
+-- $high-level
+--
+-- Convenient functions that resolve the current thread's identity internally.
+-- Each call obtains the 'ThreadId' (or numeric ID) on your behalf, which is
+-- fine for one-shot operations. If you are making multiple calls in sequence
+-- for the same thread, consider the [Raw API](#raw) or [Ref-based API](#ref-based)
+-- to avoid redundant work.
+
+
+---------------------------------------------------------------------------
+-- High-level API
+---------------------------------------------------------------------------
+
+-- | Retrieve the value associated with the current thread, if any.
+--
+-- Internally uses the fused CMM probe ('stg_probeThreadSlot#') which
+-- reads @CurrentTSO.id@ and linearly probes the key array in a single
+-- CMM call — no 'ThreadId' allocation, no FFI, no Haskell-side loop.
+lookup :: (MonadIO m) => ThreadStorageMap a -> m (Maybe a)
+lookup (ThreadStorageMap tableRef _) = liftIO $ do
+  Table _cap keys# vals# <- readIORef tableRef
+  IO $ \s0 ->
+    let !(I# mask#) = _cap - 1
+    in case stg_probeThreadSlot# keys# mask# s0 of
+      (# s1, _tid#, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case readIORef ref of { IO f -> case f s2 of
+                  { (# s3, val #) -> (# s3, Just val #) }}
+        | otherwise -> (# s1, Nothing #)
+{-# INLINE lookup #-}
+
+
+-- | Retrieve the value associated with a specific thread.
+lookupOnThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> m (Maybe a)
+lookupOnThread tsm tid = liftIO $ lookupRaw tsm (getThreadId tid)
+{-# INLINE lookupOnThread #-}
+
+
+-- | Associate a value with the current thread, replacing any previous value.
+--
+-- Returns the previous value, or 'Nothing' if the thread had no entry.
+-- A GC finalizer is registered on the first call per thread so that the
+-- entry is automatically cleaned up when the thread dies.
+--
+-- On the hot path (value already attached), no 'ThreadId' is allocated and
+-- no FFI call is made. 'myThreadId' is only called on the cold first-insert
+-- path to register the GC finalizer.
+attach :: (MonadIO m) => ThreadStorageMap a -> a -> m (Maybe a)
+attach tsm x = update tsm (\prev -> (Just x, prev))
+{-# INLINE attach #-}
+
+
+-- | Like 'attach', but targets a specific thread.
+attachOnThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> a -> m (Maybe a)
+attachOnThread tsm tid x =
+  updateOnThread tsm tid (\prev -> (Just x, prev))
+{-# INLINE attachOnThread #-}
+
+
+-- | Remove the value associated with the current thread.
+--
+-- Returns the removed value, or 'Nothing' if the thread had no entry.
+-- The slot is tombstoned so it can be reclaimed by a future 'attach' or
+-- cleaned during a table resize.
+detach :: (MonadIO m) => ThreadStorageMap a -> m (Maybe a)
+detach tsm = update tsm (\prev -> (Nothing, prev))
+{-# INLINE detach #-}
+
+
+-- | Like 'detach', but targets a specific thread.
+detachFromThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> m (Maybe a)
+detachFromThread tsm tid =
+  updateOnThread tsm tid (\prev -> (Nothing, prev))
+{-# INLINE detachFromThread #-}
+
+
+-- | Atomically read and update the value for the current thread.
+--
+-- The callback receives the current value (or 'Nothing') and returns a pair
+-- of the new value to store (or 'Nothing' to remove the entry) and an
+-- arbitrary result.
+--
+-- Uses the fused CMM probe ('stg_probeThreadSlot#') — a single CMM call
+-- reads @CurrentTSO.id@ and probes the key array. 'myThreadId' is only
+-- called on the cold first-insert path (to register a GC finalizer); the
+-- steady-state hot path makes zero FFI calls.
+--
+-- @
+-- -- Increment a counter, inserting 1 if absent:
+-- update tsm (\\old -> (Just (maybe 1 (+1) old), ()))
+-- @
+update :: (MonadIO m) => ThreadStorageMap a -> (Maybe a -> (Maybe a, b)) -> m b
+update tsm@(ThreadStorageMap tableRef _) f = liftIO $ do
+  Table cap keys# vals# <- readIORef tableRef
+  IO $ \s0 ->
+    let !(I# mask#) = cap - 1
+    in case stg_probeThreadSlot# keys# mask# s0 of
+      (# s1, tid#, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case readIORef ref of { IO readIt -> case readIt s2 of
+                  { (# s3, old #) -> case f (Just old) of
+                    (Just !new, !b) ->
+                      case writeIORef ref new of { IO writeIt -> case writeIt s3 of
+                        { (# s4, _ #) -> (# s4, b #) }}
+                    (Nothing, !b) ->
+                      case updateTombstone tsm tableRef cap keys# vals# (I# slot#) (I# tid#) of
+                        { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
+                  }}
+        | otherwise ->
+            case f Nothing of
+              (Just !new, !b) ->
+                case updateColdInsert tsm (I# tid#) new of
+                  { IO ins -> case ins s1 of { (# s2, _ #) -> (# s2, b #) }}
+              (Nothing, !b) -> (# s1, b #)
+{-# INLINE update #-}
+
+
+-- Cold path: tombstone a slot. NOINLINE keeps 'update' small for inlining.
+updateTombstone
+  :: ThreadStorageMap a
+  -> IORef (Table a)
+  -> Int
+  -> Exts.MutableByteArray# Exts.RealWorld
+  -> Exts.MutableArray# Exts.RealWorld (IORef a)
+  -> Int -> Int -> IO ()
+updateTombstone tsm tableRef cap keys# vals# slot tidKey = do
+  writeVal vals# slot toSentinel
+  writeKey keys# slot tombstone
+  Table cap' _ _ <- readIORef tableRef
+  when (cap' /= cap) $ removeEntry tsm tidKey
+{-# NOINLINE updateTombstone #-}
+
+
+-- Cold path: first insert for a thread. NOINLINE keeps 'update' small.
+updateColdInsert :: ThreadStorageMap a -> Int -> a -> IO ()
+updateColdInsert tsm tidKey new = do
+  tid <- myThreadId
+  _ <- insertNew tsm tid tidKey new
+  pure ()
+{-# NOINLINE updateColdInsert #-}
+
+-- Cold path: first insert with an already-known ThreadId.
+updateColdInsertTid :: ThreadStorageMap a -> ThreadId -> Int -> a -> IO ()
+updateColdInsertTid tsm tid tidKey new = do
+  _ <- insertNew tsm tid tidKey new
+  pure ()
+{-# NOINLINE updateColdInsertTid #-}
+
+
+-- | Like 'update', but targets a specific thread.
+--
+-- This is the most general function in the high-level API.
+-- 'attachOnThread' and 'detachFromThread' are implemented in terms of this.
+updateOnThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> (Maybe a -> (Maybe a, b)) -> m b
+updateOnThread tsm tid f = liftIO $ updateRaw tsm tid (getThreadId tid) f
+{-# INLINE updateOnThread #-}
+
+
+-- | Modify the value for the current thread in place if one is attached.
+--
+-- Does nothing if the thread has no entry. The modification is strict
+-- ('modifyIORef'').  Uses the fused CMM probe — no allocation, no FFI,
+-- no Haskell-side loop.
+adjust :: (MonadIO m) => ThreadStorageMap a -> (a -> a) -> m ()
+adjust (ThreadStorageMap tableRef _) f = liftIO $ do
+  Table _cap keys# vals# <- readIORef tableRef
+  IO $ \s0 ->
+    let !(I# mask#) = _cap - 1
+    in case stg_probeThreadSlot# keys# mask# s0 of
+      (# s1, _tid#, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case modifyIORef' ref f of { IO g -> g s2 }
+        | otherwise -> (# s1, () #)
+{-# INLINE adjust #-}
+
+
+-- | Like 'adjust', but targets a specific thread.
+adjustOnThread :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> (a -> a) -> m ()
+adjustOnThread (ThreadStorageMap tableRef _) tid f = liftIO $ do
+  Table _cap keys# vals# <- readIORef tableRef
+  let !(I# mask#) = _cap - 1
+      !(I# tidKey#) = getThreadIdInt tid
+  IO $ \s0 ->
+    case stg_probeSlotByKey# keys# mask# tidKey# s0 of
+      (# s1, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case modifyIORef' ref f of { IO g -> g s2 }
+        | otherwise -> (# s1, () #)
+{-# INLINE adjustOnThread #-}
+
+
+-- $raw
+--
+-- Pre-compute a thread's numeric ID once and reuse it across several
+-- operations, avoiding repeated FFI calls to @rts_getThreadId@.
+--
+-- @
+-- tid <- myThreadId
+-- let !tw = 'getThreadId' tid
+-- 'lookupRaw' tsm tw >>= \\case ...
+-- 'updateRaw' tsm tid tw (\\old -> ...)
+-- @
+--
+-- The 'ThreadId' is still required by 'updateRaw' because it may need to
+-- register a GC finalizer on the first insert.
+
+
+---------------------------------------------------------------------------
+-- Raw API
+---------------------------------------------------------------------------
+
+-- | Retrieve a value using a pre-computed thread ID (from 'getThreadId').
+--
+-- Avoids the FFI call to @rts_getThreadId@ that 'lookupOnThread' would
+-- make internally. Uses a CMM primop for the key-array probe.
+lookupRaw :: (MonadIO m) => ThreadStorageMap a -> Word -> m (Maybe a)
+lookupRaw (ThreadStorageMap tableRef _) !tidWord = liftIO $ do
+  Table _cap keys# vals# <- readIORef tableRef
+  let !(I# mask#) = _cap - 1
+      !(I# tidKey#) = fromIntegral tidWord :: Int
+  IO $ \s0 ->
+    case stg_probeSlotByKey# keys# mask# tidKey# s0 of
+      (# s1, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case readIORef ref of { IO f -> case f s2 of
+                  { (# s3, val #) -> (# s3, Just val #) }}
+        | otherwise -> (# s1, Nothing #)
+{-# INLINE lookupRaw #-}
+
+
+-- | Generalized update using a pre-computed thread ID.
+--
+-- Behaves like 'updateOnThread' but skips the internal 'getThreadId' call.
+-- The 'ThreadId' argument is still needed so a GC finalizer can be
+-- registered when a new entry is created.  Uses a CMM primop for the
+-- key-array probe.
+updateRaw :: (MonadIO m) => ThreadStorageMap a -> ThreadId -> Word -> (Maybe a -> (Maybe a, b)) -> m b
+updateRaw tsm@(ThreadStorageMap tableRef _) tid !tidWord f = liftIO $ do
+  let !tidKey@(I# tidKey#) = fromIntegral tidWord :: Int
+  Table cap keys# vals# <- readIORef tableRef
+  let !(I# mask#) = cap - 1
+  IO $ \s0 ->
+    case stg_probeSlotByKey# keys# mask# tidKey# s0 of
+      (# s1, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) ->
+                case readIORef ref of { IO readIt -> case readIt s2 of
+                  { (# s3, old #) -> case f (Just old) of
+                    (Just !new, !b) ->
+                      case writeIORef ref new of { IO writeIt -> case writeIt s3 of
+                        { (# s4, _ #) -> (# s4, b #) }}
+                    (Nothing, !b) ->
+                      case updateTombstone tsm tableRef cap keys# vals# (I# slot#) tidKey of
+                        { IO t -> case t s3 of { (# s4, _ #) -> (# s4, b #) }}
+                  }}
+        | otherwise ->
+            case f Nothing of
+              (Just !new, !b) ->
+                case updateColdInsertTid tsm tid tidKey new of
+                  { IO ins -> case ins s1 of { (# s2, _ #) -> (# s2, b #) }}
+              (Nothing, !b) -> (# s1, b #)
+{-# INLINE updateRaw #-}
+
+
+-- $ref-based
+--
+-- The fastest tier. On the hot path (thread already registered), the
+-- operations below avoid the hash-table probe entirely by handing you the
+-- per-thread 'IORef' directly. Subsequent reads and writes are plain
+-- 'IORef' operations.
+--
+-- Typical usage in a tracing library:
+--
+-- @
+-- -- Once per request (or per thread lifetime):
+-- (tid, ref) <- 'ensureRefFast' tsm Nothing
+--
+-- -- On every span open (hot path — no probe, no CAS):
+-- 'writeRef' ref (Just spanContext)
+--
+-- -- On every span close:
+-- ctx <- 'readRef' ref
+-- 'writeRef' ref Nothing
+-- @
+--
+-- If you already have a 'ThreadId' and numeric ID, use 'ensureRef' or
+-- 'lookupRef'. If you want the absolute fastest path and don't have a
+-- 'ThreadId' yet, use 'ensureRefFast' or 'lookupRefFast' which read
+-- @CurrentTSO.id@ and probe the key array entirely in CMM.
+
+
+---------------------------------------------------------------------------
+-- Ref-based API
+---------------------------------------------------------------------------
+
+-- | Get or create the 'IORef' for a given thread.
+--
+-- If the thread already has an entry, returns its 'IORef' (read-only probe,
+-- no CAS). Otherwise, creates a new 'IORef' initialised to @def@, claims a
+-- slot via CAS, and registers a GC finalizer for cleanup.
+--
+-- The @Int@ argument is the numeric thread ID (e.g. from
+-- 'getCurrentThreadId' or @fromIntegral . 'getThreadId'@).
+ensureRef :: ThreadStorageMap a -> ThreadId -> Int -> a -> IO (IORef a)
+ensureRef tsm@(ThreadStorageMap tableRef _) tid !tidKey def = do
+  Table cap keys# vals# <- readIORef tableRef
+  let !home = slotFor cap tidKey
+  result <- probeFind keys# vals# cap home tidKey
+  case result of
+    Just (_, ref) -> pure ref
+    Nothing -> insertNew tsm tid tidKey def
+{-# INLINE ensureRef #-}
+
+
+-- | Fused CMM fast path: get or create the 'IORef' for the /current/ thread.
+--
+-- Returns @(threadId, ref)@.
+--
+-- __Steady state__ (entry exists): read the table 'IORef', then a single
+-- CMM call reads @CurrentTSO.id@ and linearly probes the key array, then
+-- one @readArray#@ fetches the 'IORef'. No 'ThreadId' allocation, no FFI,
+-- no 'Maybe' wrapper.
+--
+-- __First call per thread__: falls back to 'myThreadId', CAS-inserts a new
+-- 'IORef' initialised to @def@, and registers a finalizer.
+ensureRefFast :: ThreadStorageMap a -> a -> IO (Int, IORef a)
+ensureRefFast tsm@(ThreadStorageMap tableRef _) def = do
+  Table _cap keys# vals# <- readIORef tableRef
+  IO $ \s0 ->
+    let !(I# mask#) = _cap - 1
+    in case stg_probeThreadSlot# keys# mask# s0 of
+      (# s1, tid#, slot# #)
+        | isTrue# (slot# >=# 0#) ->
+            case Exts.readArray# vals# slot# s1 of
+              (# s2, ref #) -> (# s2, (I# tid#, ref) #)
+        | otherwise ->
+            let IO slow = do
+                  tid <- myThreadId
+                  ref <- insertNew tsm tid (I# tid#) def
+                  pure (I# tid#, ref)
+            in slow s1
+{-# INLINE ensureRefFast #-}
+
+
+-- | Look up the 'IORef' for the /current/ thread using the fused CMM probe.
+--
+-- Returns @(threadId, 'Maybe' ('IORef' a))@. The numeric thread ID is
+-- returned so you can pass it to 'ensureRef' on the slow path without a
+-- second FFI call:
+--
+-- @
+-- (tid, mref) <- 'lookupRefFast' tsm
+-- ref <- case mref of
+--   Just r  -> pure r
+--   Nothing -> do
+--     t <- myThreadId
+--     'ensureRef' tsm t tid defaultValue
+-- @
+lookupRefFast :: ThreadStorageMap a -> IO (Int, Maybe (IORef a))
+lookupRefFast (ThreadStorageMap tableRef _) = do
+  Table _cap keys# vals# <- readIORef tableRef
+  IO $ \s0 ->
+    let !(I# mask#) = _cap - 1
+    in case stg_probeThreadSlot# keys# mask# s0 of
+      (# s1, tid#, slot# #) ->
+        if isTrue# (slot# >=# 0#)
+          then case Exts.readArray# vals# slot# s1 of
+            (# s2, ref #) -> (# s2, (I# tid#, Just ref) #)
+          else (# s1, (I# tid#, Nothing) #)
+{-# INLINE lookupRefFast #-}
+
+
+-- | Look up the 'IORef' for a thread by its numeric ID (Haskell-side probe).
+--
+-- Use this when you already have the numeric ID but not necessarily the
+-- current thread's TSO (e.g. inspecting another thread's slot).
+lookupRef :: ThreadStorageMap a -> Int -> IO (Maybe (IORef a))
+lookupRef (ThreadStorageMap tableRef _) !tidKey = do
+  Table cap keys# vals# <- readIORef tableRef
+  result <- probeFind keys# vals# cap (slotFor cap tidKey) tidKey
+  pure $! case result of
+    Nothing -> Nothing
+    Just (_, ref) -> Just ref
+{-# INLINE lookupRef #-}
+
+
+-- | Read the value from a per-thread 'IORef'.
+--
+-- Thin wrapper around 'readIORef'; provided for API symmetry with
+-- 'writeRef' and 'modifyRef'.
+readRef :: IORef a -> IO a
+readRef = readIORef
+{-# INLINE readRef #-}
+
+
+-- | Write a value into a per-thread 'IORef'.
+writeRef :: IORef a -> a -> IO ()
+writeRef = writeIORef
+{-# INLINE writeRef #-}
+
+
+-- | Strictly modify the value in a per-thread 'IORef'.
+--
+-- Equivalent to 'modifyIORef''.
+modifyRef :: IORef a -> (a -> a) -> IO ()
+modifyRef = modifyIORef'
+{-# INLINE modifyRef #-}
+
+
+---------------------------------------------------------------------------
+-- Internal: insert / remove / resize
+---------------------------------------------------------------------------
+
+insertNew :: ThreadStorageMap a -> ThreadId -> Int -> a -> IO (IORef a)
+insertNew tsm@(ThreadStorageMap tableRef resizeLock) tid !tidKey val = do
+  ref <- newIORef val
+  let go = do
+        Table cap keys# vals# <- readIORef tableRef
+        let !home = slotFor cap tidKey
+        success <- claimSlot keys# vals# cap home tidKey ref
+        if success
+          then ensureCurrent
+          else do
+            -- Table full — serialize the resize via the MVar.  Threads
+            -- that arrive while the resize is in progress block here
+            -- and retry with the (larger) new table.
+            withMVar resizeLock $ \_ -> do
+              Table curCap _ _ <- readIORef tableRef
+              when (curCap == cap) $ growTable tableRef cap
+            go
+
+      -- After CAS-claiming a slot, verify the entry is visible in the
+      -- current table.  A concurrent resize may have copied the old
+      -- table before our CAS landed, leaving the new table without our
+      -- entry.  Because resizes are serialized by the MVar, at most one
+      -- re-insertion is needed before the entry settles.
+      ensureCurrent = do
+        Table cap keys# vals# <- readIORef tableRef
+        let !home = slotFor cap tidKey
+        found <- probeFind keys# vals# cap home tidKey
+        case found of
+          Just _ -> pure ()
+          Nothing -> go
+  go
+  addThreadFinalizer tid $ removeEntry tsm tidKey
+  pure ref
+
+
+-- | Linear-probe insert. Returns 'False' if the table is full (probe
+-- wrapped all the way around without finding an empty, tombstone, or
+-- matching slot).
+--
+-- The key CAS must happen /before/ writing the value to avoid a race where
+-- two threads targeting the same empty slot both write their IORef,
+-- clobbering each other. Only the CAS winner writes the value.
+--
+-- After writing the value, a release-semantics re-write of the key
+-- (@writeKey@, which uses @atomicWriteIntArray#@) ensures the value is
+-- visible to any reader that acquires the key.
+claimSlot :: Exts.MutableByteArray# Exts.RealWorld -> Exts.MutableArray# Exts.RealWorld (IORef a) -> Int -> Int -> Int -> IORef a -> IO Bool
+claimSlot keys# vals# cap home key ref = go home 0
+  where
+    !mask = cap - 1
+    go !slot !steps
+      | steps >= cap = pure False
+      | otherwise = do
+          k <- readKey keys# slot
+          if k == emptySlot || k == tombstone
+            then do
+              success <- casKey keys# slot k key
+              if success
+                then do
+                  writeVal vals# slot ref
+                  writeKey keys# slot key
+                  pure True
+                else go slot steps
+            else if k == key
+              then do
+                writeVal vals# slot ref
+                writeKey keys# slot key
+                pure True
+              else go ((slot + 1) .&. mask) (steps + 1)
+{-# INLINE claimSlot #-}
+
+
+-- | Copy live entries into a new table of the given capacity and publish it.
+-- MUST be called while holding the resize 'MVar'. Uses plain 'writeIORef'
+-- because the lock serializes all resize operations; no CAS needed.
+-- Used for both growing (double capacity) and shrinking (after purge).
+rehashTable :: IORef (Table a) -> Int -> Int -> IO ()
+rehashTable tableRef !oldCap !newCap = do
+  Table _ oldKeys# oldVals# <- readIORef tableRef
+  newTable@(Table _ newKeys# newVals#) <- allocateTable newCap
+  let copyLoop !i
+        | i >= oldCap = pure ()
+        | otherwise = do
+            k <- readKey oldKeys# i
+            if k /= emptySlot && k /= tombstone
+              then do
+                oldRef <- readVal oldVals# i
+                if isSentinel oldRef
+                  then do
+                    yield
+                    copyLoop i
+                  else do
+                    let !home = slotFor newCap k
+                    _ <- claimSlot newKeys# newVals# newCap home k oldRef
+                    copyLoop (i + 1)
+              else copyLoop (i + 1)
+  copyLoop 0
+  writeIORef tableRef newTable
+
+
+growTable :: IORef (Table a) -> Int -> IO ()
+growTable tableRef !oldCap = rehashTable tableRef oldCap (oldCap * 2)
+
+
+-- | Tombstone an entry by key in the current table. Clears the value
+-- slot so the 'IORef' (and its payload) become eligible for GC
+-- immediately rather than lingering until the next resize.
+-- Retries if a resize occurred between the probe and the tombstone.
+removeEntry :: ThreadStorageMap a -> Int -> IO ()
+removeEntry tsm@(ThreadStorageMap tableRef _) !tidKey = do
+  Table cap keys# vals# <- readIORef tableRef
+  let !home = slotFor cap tidKey
+  result <- probeFind keys# vals# cap home tidKey
+  case result of
+    Nothing -> pure ()
+    Just (!slot, _) -> do
+      writeVal vals# slot toSentinel
+      writeKey keys# slot tombstone
+      Table cap' _ _ <- readIORef tableRef
+      when (cap' /= cap) $ removeEntry tsm tidKey
+
+
+---------------------------------------------------------------------------
+-- Monitoring
+---------------------------------------------------------------------------
+
+-- | Snapshot all live entries as @(threadId, value)@ pairs.
+--
+-- Intended for monitoring and debugging — e.g. verifying that entries are
+-- cleaned up after threads exit. The result is a point-in-time snapshot;
+-- concurrent mutations may or may not be reflected.
+storedItems :: ThreadStorageMap a -> IO [(Int, a)]
+storedItems (ThreadStorageMap tableRef _) = do
+  Table cap keys# vals# <- readIORef tableRef
+  go keys# vals# cap 0 []
+  where
+    go keys# vals# cap !i !acc
+      | i >= cap = pure (reverse acc)
+      | otherwise = do
+          k <- readKey keys# i
+          if k /= emptySlot && k /= tombstone
+            then do
+              ref <- readVal vals# i
+              if isSentinel ref
+                then go keys# vals# cap (i + 1) acc
+                else do
+                  v <- readIORef ref
+                  go keys# vals# cap (i + 1) ((k, v) : acc)
+            else go keys# vals# cap (i + 1) acc
+
+
+---------------------------------------------------------------------------
+-- SPECIALIZE pragmas
+---------------------------------------------------------------------------
+
+{-# SPECIALIZE lookup :: ThreadStorageMap a -> IO (Maybe a) #-}
+{-# SPECIALIZE lookupOnThread :: ThreadStorageMap a -> ThreadId -> IO (Maybe a) #-}
+{-# SPECIALIZE lookupRaw :: ThreadStorageMap a -> Word -> IO (Maybe a) #-}
+{-# SPECIALIZE attach :: ThreadStorageMap a -> a -> IO (Maybe a) #-}
+{-# SPECIALIZE attachOnThread :: ThreadStorageMap a -> ThreadId -> a -> IO (Maybe a) #-}
+{-# SPECIALIZE detach :: ThreadStorageMap a -> IO (Maybe a) #-}
+{-# SPECIALIZE detachFromThread :: ThreadStorageMap a -> ThreadId -> IO (Maybe a) #-}
+{-# SPECIALIZE adjust :: ThreadStorageMap a -> (a -> a) -> IO () #-}
+{-# SPECIALIZE adjustOnThread :: ThreadStorageMap a -> ThreadId -> (a -> a) -> IO () #-}
+{-# SPECIALIZE newThreadStorageMap :: IO (ThreadStorageMap a) #-}
+{-# SPECIALIZE newThreadStorageMapWith :: Int -> IO (ThreadStorageMap a) #-}
+
 
 #if MIN_VERSION_base(4,18,0)
--- | This should generally not be needed, but may be used to remove values prior to GC-triggered finalizers being run from the 'ThreadStorageMap' for threads that have exited.
-purgeDeadThreads :: MonadIO m => ThreadStorageMap a -> m ()
-purgeDeadThreads tsm = liftIO $ do
+
+---------------------------------------------------------------------------
+-- C-side SIMD batch membership test
+---------------------------------------------------------------------------
+
+-- | Lifted wrapper for a temporary 'MutableByteArray#' of @Int@ values.
+data MutIntArray = MutIntArray (Exts.MutableByteArray# Exts.RealWorld)
+
+
+newMutIntArray :: Int -> IO MutIntArray
+newMutIntArray n = IO $ \s0 ->
+  let !(I# bytes#) = n * sizeOf (0 :: Int)
+  in case Exts.newByteArray# bytes# s0 of
+    (# s1, arr# #) -> (# s1, MutIntArray arr# #)
+
+
+readMutInt :: MutIntArray -> Int -> IO Int
+readMutInt (MutIntArray arr#) (I# i#) = IO $ \s ->
+  case Exts.readIntArray# arr# i# s of
+    (# s', v# #) -> (# s', I# v# #)
+
+
+writeMutInt :: MutIntArray -> Int -> Int -> IO ()
+writeMutInt (MutIntArray arr#) (I# i#) (I# v#) = IO $ \s ->
+  case Exts.writeIntArray# arr# i# v# s of
+    s' -> (# s', () #)
+
+
+-- | Fill a 'MutIntArray' with numeric thread IDs from a @['ThreadId']@.
+-- The array is left unsorted — the C-side 'c_purge_find_dead' sorts it
+-- in place via @qsort@ before scanning.
+buildLiveSet :: [ThreadId] -> IO (MutIntArray, Int)
+buildLiveSet tids = do
+  let !n = length tids
+  arr <- newMutIntArray (max 1 n)
+  let fill [] _ = pure ()
+      fill (t : ts) !i = do
+        writeMutInt arr i (getThreadIdInt t)
+        fill ts (i + 1)
+  fill tids 0
+  pure (arr, n)
+
+
+-- | Batch membership scan implemented in C with architecture-dispatched
+-- SIMD (NEON on aarch64, SSE2 on x86_64, scalar fallback elsewhere).
+-- Sorts @live@ in place via @qsort@ (for binary-search fallback when
+-- n > 128).  Returns the count of dead slots.
+--
+-- Output layout in @dead_out@ (must hold @cap + 1@ elements):
+--
+-- @
+-- dead_out[0]          = total occupied slots before tombstoning
+-- dead_out[1 .. count] = indices of dead slots
+-- @
+foreign import ccall unsafe "purge_find_dead"
+  c_purge_find_dead
+    :: Exts.MutableByteArray# Exts.RealWorld -- keys
+    -> Int                                    -- cap
+    -> Exts.MutableByteArray# Exts.RealWorld  -- live set (sorted in place)
+    -> Int                                    -- n_live
+    -> Int                                    -- tombstone value
+    -> Exts.MutableByteArray# Exts.RealWorld  -- dead_out
+    -> IO Int                                 -- count of dead slots
+
+
+-- | Tombstone slots belonging to threads that are no longer alive,
+-- and shrink the table if the load factor drops below 25%.
+--
+-- Normally, slots are cleaned up by GC finalizers attached to the owning
+-- 'ThreadId'. This function provides an eager alternative: it calls
+-- 'GHC.Conc.listThreads' to obtain the set of live threads and tombstones
+-- any slot whose key is not in that set.
+--
+-- Internally builds a flat array of live thread IDs and passes it to a
+-- C function that @qsort@s it, then batch-scans the key array using
+-- SIMD (NEON / SSE2) linear search for small live sets or branchless
+-- binary search (Khuong / Lemire CMOV style) for large ones.  A single
+-- @unsafe ccall@ amortises FFI overhead across the full table scan.
+-- Tombstoning (key + value slot) is done on the Haskell side to
+-- maintain GC write barriers.
+--
+-- After tombstoning, if the number of remaining live entries is less
+-- than 1\/4 of the table capacity (and the capacity exceeds the 16-slot
+-- minimum), the table is rehashed to a smaller power-of-two size under
+-- the resize 'MVar' lock.  This prevents unbounded memory use after
+-- bursts of short-lived threads.
+--
+-- This is a best-effort operation: if a resize occurs concurrently, some
+-- dead entries may survive in the new table until the next purge or GC.
+--
+-- @since base 4.18.0 (GHC 9.6)
+{-# SPECIALIZE purgeDeadThreads :: ThreadStorageMap a -> IO () #-}
+purgeDeadThreads :: (MonadIO m) => ThreadStorageMap a -> m ()
+purgeDeadThreads (ThreadStorageMap tableRef resizeLock) = liftIO $ do
+  Table cap keys# vals# <- readIORef tableRef
   tids <- listThreads
-  let threadSet = IS.fromList $ map (fromIntegral . getThreadId) tids
-  forM_ [0..(numStripes - 1)] $ \stripe ->
-    atomicModifyStripe tsm stripe $ \im -> (I.restrictKeys im threadSet, ())
+  (MutIntArray liveArr#, nLive) <- buildLiveSet tids
+  deadArr@(MutIntArray deadArr#) <- newMutIntArray (cap + 1)
+  deadCount <- c_purge_find_dead keys# cap liveArr# nLive tombstone deadArr#
+  let tomb !i
+        | i > deadCount = pure ()
+        | otherwise = do
+            slot <- readMutInt deadArr i
+            writeVal vals# slot toSentinel
+            writeKey keys# slot tombstone
+            tomb (i + 1)
+  tomb 1
+  occupied <- readMutInt deadArr 0
+  let !liveInTable = occupied - deadCount
+      !minCap = 16
+      !targetCap = nextPow2 (max minCap (liveInTable * 4))
+  when (targetCap < cap) $
+    withMVar resizeLock $ \_ -> do
+      Table curCap _ _ <- readIORef tableRef
+      when (curCap == cap) $
+        rehashTable tableRef cap targetCap
 #endif
