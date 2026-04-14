@@ -21,7 +21,7 @@
  * Branchless binary search (Khuong / Lemire style)
  *
  * `sorted` must be in ascending order.  The comparison `base[half] <
- * needle` compiles to CMOV on both x86-64 and AArch64 at -O2 — no
+ * needle` compiles to CMOV on both x86-64 and AArch64 at -O2, so no
  * branch mispredictions.
  * ------------------------------------------------------------------- */
 static inline int contains_bsearch(HsInt needle,
@@ -37,7 +37,7 @@ static inline int contains_bsearch(HsInt needle,
 }
 
 /* -------------------------------------------------------------------
- * SIMD linear scan — architecture-dispatched
+ * Architecture-dispatched SIMD linear scan
  *
  * Processes 4 elements per main-loop iteration (two 128-bit loads).
  * The scalar tail handles up to 3 leftover elements.
@@ -72,10 +72,10 @@ static inline int contains_linear(HsInt needle,
 
 /*
  * SSE2-only 64-bit equality (no _mm_cmpeq_epi64 without SSE4.1):
- *   1. XOR each lane with needle — zero iff equal
- *   2. cmpeq_epi32 against zero — flags 32-bit halves that are zero
+ *   1. XOR each lane with needle (zero iff equal)
+ *   2. cmpeq_epi32 against zero (flags 32-bit halves that are zero)
  *   3. Shuffle to swap 32-bit halves within each 64-bit lane
- *   4. AND — both halves must be zero for 64-bit equality
+ *   4. AND (both halves must be zero for 64-bit equality)
  *   5. movemask to scalar
  */
 static inline int contains_linear(HsInt needle,
@@ -131,7 +131,7 @@ static inline int contains(HsInt needle, const HsInt *sorted, HsInt n) {
 }
 
 /* -------------------------------------------------------------------
- * qsort comparator for HsInt — branchless (x > y) - (x < y)
+ * qsort comparator for HsInt. Branchless: (x > y) - (x < y)
  * ------------------------------------------------------------------- */
 static int cmp_hsint(const void *a, const void *b) {
     HsInt x = *(const HsInt *)a;
@@ -143,7 +143,7 @@ static int cmp_hsint(const void *a, const void *b) {
  * purge_find_dead
  *
  * Batch membership test for purgeDeadThreads.  Called once via unsafe
- * ccall — amortises FFI overhead across the full table scan.
+ * ccall to amortise FFI overhead across the full table scan.
  *
  * Sorts live[] in place (needed for the binary search fallback when
  * n_live > LINEAR_THRESHOLD), then scans keys[0..cap).
@@ -163,6 +163,7 @@ HsInt purge_find_dead(
     HsInt *live,
     HsInt n_live,
     HsInt tombstone_val,
+    HsInt key_mask,
     HsInt *dead_out)
 {
     if (n_live > 1)
@@ -174,7 +175,8 @@ HsInt purge_find_dead(
         HsInt k = keys[i];
         if (k != 0 && k != tombstone_val) {
             occupied++;
-            if (!contains(k, live, n_live))
+            HsInt raw_k = k & key_mask;
+            if (!contains(raw_k, live, n_live))
                 dead_out[1 + dead_count++] = i;
         }
     }

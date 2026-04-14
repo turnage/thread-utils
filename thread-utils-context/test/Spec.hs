@@ -7,6 +7,7 @@ import Control.Concurrent.Thread.Storage
 import Control.Monad
 import Data.IORef
 import Data.List hiding (lookup)
+import GHC.Stats (getRTSStatsEnabled, getRTSStats, gc, gcdetails_live_bytes)
 import Test.Hspec
 import Prelude hiding (lookup)
 
@@ -179,6 +180,52 @@ main = hspec $ do
       results <- mapM readMVar resultRefs
       let expected = fmap Just [1 .. n]
       sort results `shouldBe` sort expected
+
+  describe "space leak" $ do
+    it "repeated attach/detach does not accumulate weak pointers" $ do
+      enabled <- getRTSStatsEnabled
+      unless enabled $ pendingWith "Requires +RTS -T"
+
+      let cycles = 100_000
+      tsm <- newThreadStorageMapWith 16
+      phase1Done <- newEmptyMVar
+      startPhase2 <- newEmptyMVar
+      phase2Done <- newEmptyMVar
+      keepAlive <- newEmptyMVar
+
+      _ <- forkIO $ do
+        _ <- attach tsm (0 :: Int)
+        _ <- detach tsm
+        putMVar phase1Done ()
+        takeMVar startPhase2
+        let go 0 = pure ()
+            go !n = do
+              _ <- attach tsm n
+              _ <- detach tsm
+              go (n - 1)
+        go cycles
+        putMVar phase2Done ()
+        takeMVar keepAlive
+
+      takeMVar phase1Done
+      replicateM_ 3 performGC
+      beforeStats <- getRTSStats
+      let !beforeLive = gcdetails_live_bytes (gc beforeStats)
+
+      putMVar startPhase2 ()
+      takeMVar phase2Done
+
+      replicateM_ 3 performGC
+      afterStats <- getRTSStats
+      let !afterLive = gcdetails_live_bytes (gc afterStats)
+
+      putMVar keepAlive ()
+
+      -- Each leaked Weak# + finalizer closure is ~80 bytes.
+      -- 100,000 cycles with the bug => ~8 MB of growth.
+      -- Fixed code => bounded constant (one Weak# per thread).
+      let growth = fromIntegral afterLive - fromIntegral beforeLive :: Int
+      growth `shouldSatisfy` (< 1_000_000)
 
 
 waitForCount :: ThreadStorageMap a -> Int -> IO ()
