@@ -148,10 +148,9 @@ import Data.Bits (countLeadingZeros, finiteBitSize, unsafeShiftL, (.&.), (.|.))
 import Data.IORef
 import Foreign.C.Types (CULLong (..))
 import Foreign.Storable (sizeOf)
-import GHC.Base (Addr#)
 import GHC.Conc (getNumCapabilities, yield)
 import GHC.Conc.Sync (ThreadId (..))
-import GHC.Exts (Int (..), Int#, isTrue#, unsafeCoerce#, (==#), (>=#))
+import GHC.Exts (Int (..), Int#, ThreadId#, isTrue#, unsafeCoerce#, (==#), (>=#))
 import qualified GHC.Exts as Exts
 import GHC.IO (IO (..))
 import System.IO.Unsafe (unsafePerformIO)
@@ -202,7 +201,21 @@ getCurrentThreadId = IO $ \s ->
 {-# INLINE getCurrentThreadId #-}
 
 
-foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: Addr# -> CULLong
+-- | @rts_getThreadId@ takes the TSO pointer behind a 'ThreadId'.
+--
+-- The argument MUST be declared as 'ThreadId#' rather than coerced to
+-- 'Addr#'. A 'ThreadId#' is an ordinary movable heap pointer: GHC's
+-- generational collector relocates TSOs when it promotes them. Declaring
+-- it as 'ThreadId#' keeps it in a pointer slot, so the collector traces
+-- and updates it, and (because the call is @unsafe@) no GC can run
+-- between the argument being read and the callee dereferencing it.
+--
+-- Coercing to 'Addr#' launders the pointer into a non-pointer slot that
+-- the collector neither traces nor updates. If a GC lands while the
+-- laundered word is live, the callee dereferences a stale TSO address and
+-- the process segfaults. This is the same signature @base@ uses in
+-- "GHC.Conc.Sync".
+foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: ThreadId# -> CULLong
 
 
 -- | Extract the numeric thread ID from an existing 'ThreadId'.
@@ -211,12 +224,12 @@ foreign import ccall unsafe "rts_getThreadId" c_getThreadId :: Addr# -> CULLong
 -- 'ThreadId' and need its numeric form for 'lookupRaw' or 'updateRaw', use
 -- this. Otherwise prefer 'getCurrentThreadId'.
 getThreadId :: ThreadId -> Word
-getThreadId (ThreadId tid#) = fromIntegral (c_getThreadId (unsafeCoerce# tid#))
+getThreadId (ThreadId tid#) = fromIntegral (c_getThreadId tid#)
 {-# INLINE getThreadId #-}
 
 
 getThreadIdInt :: ThreadId -> Int
-getThreadIdInt (ThreadId tid#) = fromIntegral (c_getThreadId (unsafeCoerce# tid#))
+getThreadIdInt (ThreadId tid#) = fromIntegral (c_getThreadId tid#)
 {-# INLINE getThreadIdInt #-}
 
 
