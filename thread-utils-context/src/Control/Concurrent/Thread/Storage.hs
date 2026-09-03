@@ -155,7 +155,7 @@ import qualified GHC.Exts as Exts
 import GHC.IO (IO (..))
 import System.IO.Unsafe (unsafePerformIO)
 #if MIN_VERSION_base(4,18,0)
-import GHC.Conc (listThreads)
+import GHC.Conc (ThreadStatus (..), listThreads, threadStatus)
 #endif
 import Prelude hiding (lookup)
 
@@ -1144,19 +1144,32 @@ writeMutInt (MutIntArray arr#) (I# i#) (I# v#) = IO $ \s ->
     s' -> (# s', () #)
 
 
--- | Fill a 'MutIntArray' with numeric thread IDs from a @['ThreadId']@.
+-- | Fill a 'MutIntArray' with the numeric IDs of the threads that can still
+-- run, returning how many were written.
+--
+-- Threads whose 'threadStatus' is 'ThreadFinished' or 'ThreadDied' are
+-- skipped. 'listThreads' enumerates the RTS generation thread lists, and a
+-- TSO is only unlinked from those by a GC that collects its generation --
+-- so a thread that has exited keeps being listed until then, and once it has
+-- been promoted, until the next /major/ GC.
+--
 -- The array is left unsorted; the C-side 'c_purge_find_dead' sorts it
 -- in place via @qsort@ before scanning.
 buildLiveSet :: [ThreadId] -> IO (MutIntArray, Int)
 buildLiveSet tids = do
   let !n = length tids
   arr <- newMutIntArray (max 1 n)
-  let fill [] _ = pure ()
+  let fill [] !i = pure i
       fill (t : ts) !i = do
-        writeMutInt arr i (getThreadIdInt t)
-        fill ts (i + 1)
-  fill tids 0
-  pure (arr, n)
+        status <- threadStatus t
+        case status of
+          ThreadFinished -> fill ts i
+          ThreadDied -> fill ts i
+          _ -> do
+            writeMutInt arr i (getThreadIdInt t)
+            fill ts (i + 1)
+  nLive <- fill tids 0
+  pure (arr, nLive)
 
 
 -- | Batch membership scan implemented in C with architecture-dispatched
@@ -1187,8 +1200,9 @@ foreign import ccall unsafe "purge_find_dead"
 --
 -- Normally, slots are cleaned up by GC finalizers attached to the owning
 -- 'ThreadId'. This function provides an eager alternative: it calls
--- 'GHC.Conc.listThreads' to obtain the set of live threads and tombstones
--- any slot whose key is not in that set.
+-- 'GHC.Conc.listThreads', discards the entries that have already finished or
+-- died (a 'listThreads' result keeps naming exited threads until a GC unlinks
+-- their TSOs), and tombstones any slot whose key is not in what remains.
 --
 -- Internally builds a flat array of live thread IDs and passes it to a
 -- C function that @qsort@s it, then batch-scans the key array using
